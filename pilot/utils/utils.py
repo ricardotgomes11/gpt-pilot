@@ -8,6 +8,7 @@ import distro
 import json
 import hashlib
 import re
+import copy
 from jinja2 import Environment, FileSystemLoader
 from .style import color_green
 
@@ -33,9 +34,8 @@ def capitalize_first_word_with_underscores(s):
     return capitalized_string
 
 
-def get_prompt(prompt_name, data=None):
-    if data is None:
-        data = {}
+def get_prompt(prompt_name, original_data=None):
+    data = copy.deepcopy(original_data) if original_data is not None else {}
 
     get_prompt_components(data)
 
@@ -203,3 +203,8 @@ def json_serial(obj):
         return str(obj)
     else:
         return str(obj)
+
+def remove_lines_with_string(file_content, matching_string):
+    lines = file_content.split('\n')
+    new_lines = [line for line in lines if matching_string not in line.lower()]
+    return '\n'.join(new_lines)

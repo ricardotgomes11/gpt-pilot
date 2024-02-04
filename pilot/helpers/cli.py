@@ -9,9 +9,9 @@ import platform
 from typing import Dict, Union
 
 from logger.logger import logger
-from utils.style import color_yellow, color_green, color_red, color_yellow_bold
+from utils.style import color_green, color_red, color_yellow_bold
 from utils.ignore import IgnoreMatcher
-from database.database import get_saved_command_run, save_command_run
+from database.database import save_command_run
 from helpers.exceptions import TooDeepRecursionError
 from helpers.exceptions import TokenLimitError
 from helpers.exceptions import CommandFinishedEarly
@@ -194,6 +194,7 @@ def execute_command(project, command, timeout=None, success_message=None, comman
                             If `cli_response` not None: 'was interrupted by user', 'timed out' or `None` - caller should send `cli_response` to LLM
         exit_code (int): The exit code of the process.
     """
+    project.finish_loading()
     if timeout is not None:
         if timeout < 0:
             timeout = None
@@ -213,8 +214,7 @@ def execute_command(project, command, timeout=None, success_message=None, comman
 
         print('yes/no', type='buttons-only')
         logger.info('--------- EXECUTE COMMAND ---------- : %s', question)
-        answer = ask_user(project, 'If yes, just press ENTER. Otherwise, type "no" but it will be processed as '
-                                   'successfully executed.', False, hint=question)
+        answer = ask_user(project, question, False, hint='If yes, just press ENTER. Otherwise, type "no" but it will be processed as successfully executed.')
         # TODO can we use .confirm(question, default='yes').ask()  https://questionary.readthedocs.io/en/stable/pages/types.html#confirmation
         print('answer: ' + answer)
         if answer.lower() in NEGATIVE_ANSWERS:
@@ -231,11 +231,6 @@ def execute_command(project, command, timeout=None, success_message=None, comman
         command = f"bash -c '{command}'"
 
     project.command_runs_count += 1
-    command_run = get_saved_command_run(project, command)
-    if command_run is not None and project.skip_steps:
-        project.checkpoints['last_command_run'] = command_run
-        print(color_yellow(f'Restoring command run response id {command_run.id}:\n```\n{command_run.cli_response}```'))
-        return command_run.cli_response, command_run.done_or_error_response, command_run.exit_code
 
     return_value = None
     done_or_error_response = None
@@ -321,7 +316,8 @@ def execute_command(project, command, timeout=None, success_message=None, comman
     return return_value, done_or_error_response, process.returncode
 
 
-def check_if_command_successful(convo, command, cli_response, response, exit_code, additional_message=None):
+def check_if_command_successful(convo, command, cli_response, response, exit_code, additional_message=None,
+                                task_steps=None, step_index=None):
     if cli_response is not None:
         logger.info(f'`{command}` ended with exit code: {exit_code}')
         if exit_code is None:
@@ -336,8 +332,12 @@ def check_if_command_successful(convo, command, cli_response, response, exit_cod
                                               'command': command,
                                               'additional_message': additional_message,
                                               'exit_code': exit_code,
+                                              'task_steps': task_steps,
+                                              'step_index': step_index,
                                           })
             logger.debug(f'LLM response to ran_command.prompt: {response}')
+            if response == 'DONE':
+                convo.remove_last_x_messages(2)
 
     return response
 
@@ -397,7 +397,7 @@ def build_directory_tree(path, prefix='', root_path=None) -> str:
     return output
 
 
-def execute_command_and_check_cli_response(convo, command: dict):
+def execute_command_and_check_cli_response(convo, command: dict, task_steps=None, step_index=None):
     """
     Execute a command and check its CLI response.
 
@@ -406,12 +406,14 @@ def execute_command_and_check_cli_response(convo, command: dict):
         command (dict):
           ['command'] (str): The command to run.
           ['timeout'] (int): The maximum execution time in milliseconds.
+        task_steps (list, optional): The steps of the current task. Default is None.
+        step_index (int, optional): The index of the current step. Default is None.
 
 
     Returns:
         tuple: A tuple containing the CLI response and the agent's response.
             - cli_response (str): The command output.
-            - response (str): 'DONE' or 'NEEDS_DEBUGGING'.
+            - response (str): 'DONE' or 'BUG'.
                 If `cli_response` is None, user's response to "Can I execute...".
     """
     # TODO: Prompt mentions `command` could be `INSTALLED` or `NOT_INSTALLED`, where is this handled?
@@ -421,7 +423,8 @@ def execute_command_and_check_cli_response(convo, command: dict):
                                                         timeout=command['timeout'],
                                                         command_id=command_id)
 
-    response = check_if_command_successful(convo, command['command'], cli_response, response, exit_code)
+    response = check_if_command_successful(convo, command['command'], cli_response, response, exit_code,
+                                           task_steps=task_steps, step_index=step_index)
     return cli_response, response
 
 
@@ -433,7 +436,9 @@ def run_command_until_success(convo, command,
                               force=False,
                               return_cli_response=False,
                               success_with_cli_response=False,
-                              is_root_task=False):
+                              is_root_task=False,
+                              task_steps=None,
+                              step_index=None):
     """
     Run a command until it succeeds or reaches a timeout.
 
@@ -450,6 +455,8 @@ def run_command_until_success(convo, command,
         success_with_cli_response (bool, optional): If True, simply send the cli_response back to the caller without checking with LLM.
                                                     The LLM has asked to see the output and may update the task step list.
         is_root_task (bool, optional): If True and TokenLimitError is raised, will call `convo.load_branch(reset_branch_id)`
+        task_steps (list, optional): The steps of the current task. Default is None.
+        step_index (int, optional): The index of the current step. Default is None.
 
     Returns:
         - 'success': bool,
@@ -472,12 +479,13 @@ def run_command_until_success(convo, command,
     if cli_response is None and response != 'DONE':
         return {'success': False, 'user_input': response}
 
-    response = check_if_command_successful(convo, command, cli_response, response, exit_code, additional_message)
+    response = check_if_command_successful(convo, command, cli_response, response, exit_code, additional_message,
+                                           task_steps=task_steps, step_index=step_index)
     if response:
         response = response.strip()
 
     if response != 'DONE':
-        # 'NEEDS_DEBUGGING'
+        # 'BUG'
         print(color_red('Got incorrect CLI response:'))
         print(cli_response)
         print(color_red('-------------------'))
@@ -493,7 +501,7 @@ def run_command_until_success(convo, command,
                     'timeout': timeout,
                     'command_id': command_id,
                     'success_message': success_message,
-                },user_input=cli_response, is_root_task=is_root_task, ask_before_debug=True)
+                },user_input=cli_response, is_root_task=is_root_task, ask_before_debug=True, task_steps=task_steps, step_index=step_index)
                 return {'success': success, 'cli_response': cli_response}
             except TooDeepRecursionError as e:
                 # this is only to put appropriate message in the response after TooDeepRecursionError is raised
